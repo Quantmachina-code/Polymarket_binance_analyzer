@@ -1,6 +1,6 @@
 import pandas as pd
 
-from pipeline import _slug_matches, binance_quality_report, joined_quality_report
+from pipeline import _slug_matches, binance_quality_report, generate_candidate_slugs, joined_quality_report
 
 
 def test_binance_quality_report_basic():
@@ -32,3 +32,8 @@ def test_joined_quality_report_basic():
 def test_slug_filter_for_single_asset():
     assert _slug_matches("btc-updown-5m-1772482800", "btc")
     assert not _slug_matches("sol-updown-5m-1772452500", "btc")
+
+
+def test_generate_candidate_slugs_pattern():
+    slugs = generate_candidate_slugs("btc", lookback_days=1, forward_hours=0)
+    assert any(s.startswith("btc-updown-5m-") for s in slugs)

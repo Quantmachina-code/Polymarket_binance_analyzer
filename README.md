@@ -1,10 +1,12 @@
-# Step-by-step Binance + Dynamic Polymarket Dataset Pipeline
+# Step-by-step Binance + Polymarket Dataset Pipeline
 
-This pipeline is designed to be testable in small runs first:
+This version uses **hardcoded slug-iteration logic** for Polymarket markets:
 
-1. **Step 1**: Download Binance 1-minute data + quality report.
-2. **Step 2**: Discover dynamic Polymarket 5m up/down markets + fetch history + quality report.
-3. **Step 3**: Join both datasets + quality report.
+- `btc-updown-5m-<epoch>`
+- `eth-updown-5m-<epoch>`
+- `sol-updown-5m-<epoch>`
+
+(and `bitcoin/ethereum/solana` variants).
 
 ## Install
 
@@ -17,34 +19,23 @@ pip install -r requirements.txt
 ## Small setup (one crypto, quickest validation)
 
 ```bash
-# BTC only on Binance
+# 1) Binance BTC only
 python pipeline.py step1-binance --asset btc --months 1 --output-dir data_small
 
-# BTC dynamic Polymarket discovery, max 10 markets, last 7 days
+# 2) Polymarket via hardcoded slug iteration (NOT discovery)
 python pipeline.py step2-polymarket --asset btc --max-markets 10 --lookback-days 7 --output-dir data_small
 
-# Join + checks
+# 3) Join + checks
 python pipeline.py step3-join --asset btc --output-dir data_small
 ```
 
-## Full setup (all cryptos)
+## Full setup
 
 ```bash
 python pipeline.py run-steps --asset all --months 3 --max-markets 25 --lookback-days 14 --output-dir data
 ```
 
-## Outputs
-
-- `binance_1m.parquet`
-- `binance_quality_report.csv`
-- `polymarket_dynamic_markets.parquet`
-- `polymarket_history.parquet`
-- `polymarket_orderbook_snapshots.parquet`
-- `polymarket_quality_report.csv`
-- `joined_modeling_dataset.parquet`
-- `joined_quality_report.csv`
-
 ## Notes
 
-- Dynamic Polymarket market discovery is done from Gamma `/markets` data and filtered by rolling 5m up/down patterns (e.g. `btc-updown-5m-...`, `sol-updown-5m-...`).
-- `pyarrow` and `fastparquet` are included in requirements for parquet support.
+- Step2 no longer discovers from generic market scans; it iterates expected slug names across 5-minute epoch buckets and fetches exact matches.
+- Parquet dependencies are included in `requirements.txt` (`pyarrow`, `fastparquet`).

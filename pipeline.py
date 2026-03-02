@@ -15,6 +15,11 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 SYMBOLS = ["BTCUSDC", "ETHUSDC", "SOLUSDC"]
 ASSET_MAP = {"btc": "BTCUSDC", "eth": "ETHUSDC", "sol": "SOLUSDC"}
+ASSET_SLUG_PREFIXES = {
+    "btc": ["btc-updown-5m", "bitcoin-updown-5m"],
+    "eth": ["eth-updown-5m", "ethereum-updown-5m"],
+    "sol": ["sol-updown-5m", "solana-updown-5m"],
+}
 EVENT_PATTERNS = [
     re.compile(r"btc[-_]updown[-_]5m", re.IGNORECASE),
     re.compile(r"eth[-_]updown[-_]5m", re.IGNORECASE),
@@ -158,28 +163,77 @@ def _slug_matches(slug: str, asset: str) -> bool:
     return False
 
 
-def fetch_dynamic_polymarket_markets(asset: str, market_limit: int, max_markets: int) -> pd.DataFrame:
-    """Robust discovery by scanning /markets directly (works even when /events filtering is sparse)."""
-    markets = _request_json(f"{GAMMA_BASE}/markets", {"limit": market_limit, "active": True, "closed": False})
-    mdf = pd.DataFrame(markets)
-    if mdf.empty:
-        return mdf
+def _round_down_5m_epoch(ts: int) -> int:
+    return ts - (ts % 300)
 
-    text_cols = [c for c in ["slug", "question", "description"] if c in mdf.columns]
-    if not text_cols:
-        return pd.DataFrame()
 
-    text = mdf[text_cols].fillna("").agg(" ".join, axis=1)
-    keep = text.apply(lambda t: _slug_matches(t, asset))
-    out = mdf.loc[keep].copy()
+def generate_candidate_slugs(asset: str, lookback_days: int, forward_hours: int = 6) -> List[str]:
+    """Hardcoded iteration by naming logic: <asset>-updown-5m-<epoch_5m>."""
+    now = int(time.time())
+    end_ts = _round_down_5m_epoch(now + forward_hours * 3600)
+    start_ts = _round_down_5m_epoch(now - lookback_days * 24 * 3600)
 
-    # prioritize most recently ending markets when available
-    if "endDate" in out.columns:
-        out = out.sort_values("endDate", ascending=False)
+    assets = ["btc", "eth", "sol"] if asset == "all" else [asset]
+    slugs: List[str] = []
+    for a in assets:
+        for base in ASSET_SLUG_PREFIXES[a]:
+            t = start_ts
+            while t <= end_ts:
+                slugs.append(f"{base}-{t}")
+                t += 300
+    return slugs
 
-    if max_markets > 0:
-        out = out.head(max_markets)
-    return out
+
+def _fetch_market_by_slug(slug: str) -> List[dict]:
+    """Try slug-specific routes first, then constrained market scan fallback."""
+    # Attempt direct market slug query.
+    try:
+        out = _request_json(f"{GAMMA_BASE}/markets", {"slug": slug, "limit": 20})
+        rows = out if isinstance(out, list) else [out]
+        exact = [r for r in rows if str(r.get("slug", "")).lower() == slug.lower()]
+        if exact:
+            return exact
+    except Exception:
+        pass
+
+    # Fallback via event slug endpoint, then map to markets by event id.
+    event_id = None
+    try:
+        ev = _request_json(f"{GAMMA_BASE}/events/slug/{slug}")
+        event_id = str(ev.get("id")) if isinstance(ev, dict) and ev.get("id") is not None else None
+    except Exception:
+        pass
+
+    if event_id:
+        try:
+            out = _request_json(f"{GAMMA_BASE}/markets", {"eventId": event_id, "limit": 50})
+            rows = out if isinstance(out, list) else [out]
+            exact = [r for r in rows if str(r.get("slug", "")).lower() == slug.lower()]
+            if exact:
+                return exact
+        except Exception:
+            pass
+
+    return []
+
+
+def fetch_markets_by_hardcoded_slug_iteration(asset: str, lookback_days: int, max_markets: int) -> pd.DataFrame:
+    candidates = generate_candidate_slugs(asset=asset, lookback_days=lookback_days)
+    seen_ids = set()
+    rows: List[dict] = []
+
+    for slug in candidates:
+        found = _fetch_market_by_slug(slug)
+        for m in found:
+            mid = str(m.get("id", ""))
+            if not mid or mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            rows.append(m)
+            if max_markets > 0 and len(rows) >= max_markets:
+                return pd.DataFrame(rows)
+
+    return pd.DataFrame(rows)
 
 
 def _extract_token_ids(market_row: pd.Series) -> List[str]:
@@ -266,13 +320,7 @@ def fetch_polymarket_history(markets_df: pd.DataFrame, out_dir: Path, lookback_d
 
 
 def polymarket_quality_report(hist_df: pd.DataFrame, ob_df: pd.DataFrame, markets_df: pd.DataFrame) -> pd.DataFrame:
-    rows = [
-        {
-            "discovered_markets": int(len(markets_df)),
-            "history_rows": int(len(hist_df)),
-            "orderbook_snapshots": int(len(ob_df)),
-        }
-    ]
+    rows = [{"discovered_markets": int(len(markets_df)), "history_rows": int(len(hist_df)), "orderbook_snapshots": int(len(ob_df))}]
     if not hist_df.empty:
         for fidelity, g in hist_df.groupby("fidelity"):
             rows.append(
@@ -353,11 +401,15 @@ def cmd_step2_polymarket(args):
     ensure_dir(out)
     asset = _normalize_asset(args.asset)
 
-    markets_df = fetch_dynamic_polymarket_markets(asset=asset, market_limit=args.market_limit, max_markets=args.max_markets)
+    markets_df = fetch_markets_by_hardcoded_slug_iteration(
+        asset=asset,
+        lookback_days=args.lookback_days,
+        max_markets=args.max_markets,
+    )
     markets_df.to_parquet(out / "polymarket_dynamic_markets.parquet", index=False)
 
     if markets_df.empty:
-        print("No markets discovered. Try --asset all and/or increase --market-limit.")
+        print("No markets found from hardcoded slug iteration. Increase --lookback-days.")
         pd.DataFrame().to_parquet(out / "polymarket_history.parquet", index=False)
         pd.DataFrame().to_parquet(out / "polymarket_orderbook_snapshots.parquet", index=False)
         report = polymarket_quality_report(pd.DataFrame(), pd.DataFrame(), markets_df)
@@ -393,7 +445,7 @@ def cmd_run_steps(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Step-by-step Binance + dynamic Polymarket data pipeline")
+    parser = argparse.ArgumentParser(description="Step-by-step Binance + hardcoded-logic Polymarket data pipeline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -404,10 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
     s1.add_argument("--months", type=int, default=3)
     s1.set_defaults(func=cmd_step1_binance)
 
-    s2 = sub.add_parser("step2-polymarket", parents=[common], help="Dynamic Polymarket markets + historical fetch + quality checks")
-    s2.add_argument("--market-limit", type=int, default=3000)
-    s2.add_argument("--max-markets", type=int, default=25, help="small setup: cap discovered markets")
-    s2.add_argument("--lookback-days", type=int, default=14, help="small setup: lookback window for historical data")
+    s2 = sub.add_parser("step2-polymarket", parents=[common], help="Hardcoded slug iteration + historical fetch + quality checks")
+    s2.add_argument("--max-markets", type=int, default=25, help="cap matched markets for small setup")
+    s2.add_argument("--lookback-days", type=int, default=14, help="how far back to iterate 5m slug timestamps")
     s2.set_defaults(func=cmd_step2_polymarket)
 
     s3 = sub.add_parser("step3-join", parents=[common], help="Join Binance and Polymarket + quality checks")
@@ -415,7 +466,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     s4 = sub.add_parser("run-steps", parents=[common], help="Run steps 1 -> 3")
     s4.add_argument("--months", type=int, default=3)
-    s4.add_argument("--market-limit", type=int, default=3000)
     s4.add_argument("--max-markets", type=int, default=25)
     s4.add_argument("--lookback-days", type=int, default=14)
     s4.set_defaults(func=cmd_run_steps)
