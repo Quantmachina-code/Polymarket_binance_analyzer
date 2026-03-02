@@ -264,36 +264,38 @@ def fetch_polymarket_history(markets_df: pd.DataFrame, out_dir: Path, lookback_d
     for _, row in markets_df.iterrows():
         market_id = str(row.get("id", row.get("conditionId", "")))
         token_ids = _extract_token_ids(row)
-        if not market_id:
+        if not market_id or not token_ids:
             continue
 
-        for fidelity in [60, 300]:
-            for ep in endpoints:
-                try:
-                    payload = _request_json(
-                        f"{ep.base_url}{ep.path}",
-                        {"market": market_id, "startTs": start, "endTs": now, "fidelity": fidelity},
-                        timeout=10,
-                    )
-                    history = payload.get("history", payload if isinstance(payload, list) else [])
-                    for p in history:
-                        ts = p.get("t") or p.get("timestamp")
-                        price = p.get("p") or p.get("price")
-                        if ts is None or price is None:
-                            continue
-                        hist_rows.append(
-                            {
-                                "market_id": market_id,
-                                "fidelity": fidelity,
-                                "ts": pd.to_datetime(int(ts), unit="s", utc=True),
-                                "price": float(price),
-                            }
-                        )
-                    break
-                except Exception:
-                    continue
-
+        # Historical CLOB price history is token-based for YES/NO legs.
         for token_id in token_ids:
+            for fidelity in [60, 300]:
+                for ep in endpoints:
+                    try:
+                        payload = _request_json(
+                            f"{ep.base_url}{ep.path}",
+                            {"market": token_id, "startTs": start, "endTs": now, "fidelity": fidelity},
+                            timeout=10,
+                        )
+                        history = payload.get("history", payload if isinstance(payload, list) else [])
+                        for p in history:
+                            ts = p.get("t") or p.get("timestamp")
+                            price = p.get("p") or p.get("price")
+                            if ts is None or price is None:
+                                continue
+                            hist_rows.append(
+                                {
+                                    "market_id": market_id,
+                                    "token_id": token_id,
+                                    "fidelity": fidelity,
+                                    "ts": pd.to_datetime(int(ts), unit="s", utc=True),
+                                    "price": float(price),
+                                }
+                            )
+                        break
+                    except Exception:
+                        continue
+
             try:
                 ob = _request_json(f"{CLOB_BASE}/book", {"token_id": token_id}, timeout=8)
                 bids = ob.get("bids", [])
@@ -329,7 +331,7 @@ def polymarket_quality_report(hist_df: pd.DataFrame, ob_df: pd.DataFrame, market
                     "fidelity": int(fidelity),
                     "rows": int(len(g)),
                     "unique_markets": int(g["market_id"].nunique()),
-                    "duplicates_market_ts": int(g.duplicated(subset=["market_id", "ts"]).sum()),
+                    "duplicates_market_token_ts": int(g.duplicated(subset=["market_id", "token_id", "ts"]).sum()),
                     "null_price": int(g["price"].isna().sum()),
                     "price_out_of_0_1": int(((g["price"] < 0) | (g["price"] > 1)).sum()),
                     "orderbook_snapshots": int(len(ob_df)),

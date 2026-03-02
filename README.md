@@ -38,4 +38,5 @@ python pipeline.py run-steps --asset all --months 3 --max-markets 25 --lookback-
 ## Notes
 
 - Step2 no longer discovers from generic market scans; it iterates expected slug names across 5-minute epoch buckets and fetches exact matches.
+- Step2 fetches historical prices by **token_id (YES/NO legs)**, which is required for CLOB historical price endpoints.
 - Parquet dependencies are included in `requirements.txt` (`pyarrow`, `fastparquet`).
