@@ -1,10 +1,10 @@
 # Step-by-step Binance + Dynamic Polymarket Dataset Pipeline
 
-This project now follows the exact staged workflow:
+This pipeline is designed to be testable in small runs first:
 
-1. **Step 1**: Download Binance 1-minute data for `BTCUSDC`, `ETHUSDC`, `SOLUSDC` (default past 3 months), then run a data-quality sweep.
-2. **Step 2**: Dynamically discover active Polymarket up/down 5-minute crypto events (e.g. rolling URLs like `sol-updown-5m-...`, `btc-updown-5m-...`), fetch history/orderbook snapshots, then run quality checks.
-3. **Step 3**: Join Binance + Polymarket datasets into a modeling-ready table and run join quality checks.
+1. **Step 1**: Download Binance 1-minute data + quality report.
+2. **Step 2**: Discover dynamic Polymarket 5m up/down markets + fetch history + quality report.
+3. **Step 3**: Join both datasets + quality report.
 
 ## Install
 
@@ -14,38 +14,37 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run stage by stage
+## Small setup (one crypto, quickest validation)
 
 ```bash
-# Step 1: Binance 1m + quality
-python pipeline.py step1-binance --months 3 --output-dir data
+# BTC only on Binance
+python pipeline.py step1-binance --asset btc --months 1 --output-dir data_small
 
-# Step 2: Dynamic Polymarket discovery + history/orderbook + quality
-python pipeline.py step2-polymarket --output-dir data
+# BTC dynamic Polymarket discovery, max 10 markets, last 7 days
+python pipeline.py step2-polymarket --asset btc --max-markets 10 --lookback-days 7 --output-dir data_small
 
-# Step 3: Join and quality sweep
-python pipeline.py step3-join --output-dir data
+# Join + checks
+python pipeline.py step3-join --asset btc --output-dir data_small
 ```
 
-Or all three:
+## Full setup (all cryptos)
 
 ```bash
-python pipeline.py run-steps --months 3 --output-dir data
+python pipeline.py run-steps --asset all --months 3 --max-markets 25 --lookback-days 14 --output-dir data
 ```
 
-## Output files
+## Outputs
 
-- `data/binance_1m.parquet`
-- `data/binance_quality_report.csv`
-- `data/polymarket_dynamic_events.parquet`
-- `data/polymarket_dynamic_markets.parquet`
-- `data/polymarket_history.parquet`
-- `data/polymarket_orderbook_snapshots.parquet`
-- `data/polymarket_quality_report.csv`
-- `data/joined_modeling_dataset.parquet`
-- `data/joined_quality_report.csv`
+- `binance_1m.parquet`
+- `binance_quality_report.csv`
+- `polymarket_dynamic_markets.parquet`
+- `polymarket_history.parquet`
+- `polymarket_orderbook_snapshots.parquet`
+- `polymarket_quality_report.csv`
+- `joined_modeling_dataset.parquet`
+- `joined_quality_report.csv`
 
 ## Notes
 
-- Polymarket event URLs are dynamic over time; this pipeline detects matching active events by slug pattern instead of hardcoding a fixed URL.
-- If an endpoint changes behavior, endpoint probing is used to find a working historical route.
+- Dynamic Polymarket market discovery is done from Gamma `/markets` data and filtered by rolling 5m up/down patterns (e.g. `btc-updown-5m-...`, `sol-updown-5m-...`).
+- `pyarrow` and `fastparquet` are included in requirements for parquet support.
