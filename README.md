@@ -1,43 +1,51 @@
-# Polymarket + Binance Crypto Prediction Pipeline
+# Step-by-step Binance + Dynamic Polymarket Dataset Pipeline
 
-This repository provides a step-by-step, testable pipeline to:
+This project now follows the exact staged workflow:
 
-1. Download 1-minute Binance OHLCV data (BTCUSDC, ETHUSDC, SOLUSDC) for the last 3 months.
-2. Dynamically discover Polymarket historical data endpoints and download 1-minute + 5-minute market data for crypto markets (and optional 15-minute where available).
-3. Build a comprehensive modeling dataset with technical indicators, volume features, lags, and Polymarket microstructure-style features.
-4. Train/evaluate a probabilistic model for the next 5-minute market move.
-5. Simulate a simple arbitrage-style trading strategy using model probabilities vs Polymarket implied probabilities.
+1. **Step 1**: Download Binance 1-minute data for `BTCUSDC`, `ETHUSDC`, `SOLUSDC` (default past 3 months), then run a data-quality sweep.
+2. **Step 2**: Dynamically discover active Polymarket up/down 5-minute crypto events (e.g. rolling URLs like `sol-updown-5m-...`, `btc-updown-5m-...`), fetch history/orderbook snapshots, then run quality checks.
+3. **Step 3**: Join Binance + Polymarket datasets into a modeling-ready table and run join quality checks.
 
-## Quickstart
+## Install
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python pipeline.py run-all --months 3 --output-dir data
 ```
 
-## Stage-by-stage commands
+## Run stage by stage
 
 ```bash
-# 1) Binance data only
-python pipeline.py fetch-binance --months 3 --output-dir data
+# Step 1: Binance 1m + quality
+python pipeline.py step1-binance --months 3 --output-dir data
 
-# 2) Discover Polymarket hosts + fetch history/orderbook snapshots
-python pipeline.py fetch-polymarket --output-dir data
+# Step 2: Dynamic Polymarket discovery + history/orderbook + quality
+python pipeline.py step2-polymarket --output-dir data
 
-# 3) Build features and targets
-python pipeline.py build-features --output-dir data
-
-# 4) Train + evaluate
-python pipeline.py train-model --output-dir data
-
-# 5) Backtest trading/arbitrage logic
-python pipeline.py backtest --output-dir data
+# Step 3: Join and quality sweep
+python pipeline.py step3-join --output-dir data
 ```
+
+Or all three:
+
+```bash
+python pipeline.py run-steps --months 3 --output-dir data
+```
+
+## Output files
+
+- `data/binance_1m.parquet`
+- `data/binance_quality_report.csv`
+- `data/polymarket_dynamic_events.parquet`
+- `data/polymarket_dynamic_markets.parquet`
+- `data/polymarket_history.parquet`
+- `data/polymarket_orderbook_snapshots.parquet`
+- `data/polymarket_quality_report.csv`
+- `data/joined_modeling_dataset.parquet`
+- `data/joined_quality_report.csv`
 
 ## Notes
 
-- Polymarket APIs can evolve. Host and route discovery is implemented dynamically by probing known hosts/routes.
-- For historical orderbook depth, public endpoints may be limited. The pipeline stores available orderbook snapshots and trade/price history to approximate buy/sell pressure features.
-- The model is probability-oriented and calibrated with isotonic regression.
+- Polymarket event URLs are dynamic over time; this pipeline detects matching active events by slug pattern instead of hardcoding a fixed URL.
+- If an endpoint changes behavior, endpoint probing is used to find a working historical route.

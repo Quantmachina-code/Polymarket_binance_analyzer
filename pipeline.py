@@ -1,21 +1,28 @@
 import argparse
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import requests
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import brier_score_loss, roc_auc_score
 
 
 BINANCE_BASE = "https://api.binance.com"
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE = "https://clob.polymarket.com"
 SYMBOLS = ["BTCUSDC", "ETHUSDC", "SOLUSDC"]
+EVENT_PATTERNS = [
+    re.compile(r"btc-updown-5m", re.IGNORECASE),
+    re.compile(r"eth-updown-5m", re.IGNORECASE),
+    re.compile(r"sol-updown-5m", re.IGNORECASE),
+    re.compile(r"bitcoin-updown-5m", re.IGNORECASE),
+    re.compile(r"ethereum-updown-5m", re.IGNORECASE),
+    re.compile(r"solana-updown-5m", re.IGNORECASE),
+]
 
 
 @dataclass
@@ -24,27 +31,31 @@ class EndpointCandidate:
     path: str
 
 
-def _request_json(url: str, params: Optional[dict] = None, timeout: int = 20):
-    r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def fetch_binance_1m(symbol: str, months: int = 3) -> pd.DataFrame:
+def _request_json(url: str, params: Optional[dict] = None, timeout: int = 30):
+    response = requests.get(url, params=params, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+# ===========================
+# STEP 1: BINANCE + QA SWEEP
+# ===========================
+def fetch_binance_1m(symbol: str, months: int) -> pd.DataFrame:
     end = datetime.now(tz=timezone.utc)
     start = end - timedelta(days=30 * months)
+
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
 
-    all_rows = []
+    rows: List[list] = []
     while start_ms < end_ms:
-        data = _request_json(
+        payload = _request_json(
             f"{BINANCE_BASE}/api/v3/klines",
-            params={
+            {
                 "symbol": symbol,
                 "interval": "1m",
                 "startTime": start_ms,
@@ -52,11 +63,12 @@ def fetch_binance_1m(symbol: str, months: int = 3) -> pd.DataFrame:
                 "limit": 1000,
             },
         )
-        if not data:
+        if not payload:
             break
-        all_rows.extend(data)
-        start_ms = int(data[-1][0]) + 60_000
-        time.sleep(0.06)
+
+        rows.extend(payload)
+        start_ms = int(payload[-1][0]) + 60_000
+        time.sleep(0.05)
 
     cols = [
         "open_time",
@@ -72,109 +84,153 @@ def fetch_binance_1m(symbol: str, months: int = 3) -> pd.DataFrame:
         "taker_buy_quote",
         "ignore",
     ]
-    df = pd.DataFrame(all_rows, columns=cols)
+    df = pd.DataFrame(rows, columns=cols)
     if df.empty:
         return df
 
-    numeric_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_asset_volume",
-        "num_trades",
-        "taker_buy_base",
-        "taker_buy_quote",
-    ]
-    for c in numeric_cols:
+    for c in ["open", "high", "low", "close", "volume", "quote_asset_volume", "taker_buy_base", "taker_buy_quote"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["num_trades"] = pd.to_numeric(df["num_trades"], errors="coerce").astype("Int64")
 
     df["ts"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["symbol"] = symbol
-    return df[["ts", "symbol", "open", "high", "low", "close", "volume", "num_trades", "taker_buy_base"]]
+
+    return df[["ts", "symbol", "open", "high", "low", "close", "volume", "quote_asset_volume", "num_trades", "taker_buy_base", "taker_buy_quote"]].sort_values("ts")
 
 
+def binance_quality_report(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    reports = []
+    for symbol, g in df.groupby("symbol"):
+        g = g.sort_values("ts").reset_index(drop=True)
+        diffs = g["ts"].diff().dt.total_seconds().dropna()
+        missing_minutes = int((diffs > 60).sum())
+
+        report = {
+            "symbol": symbol,
+            "rows": int(len(g)),
+            "start_ts": g["ts"].min(),
+            "end_ts": g["ts"].max(),
+            "duplicate_timestamps": int(g.duplicated(subset=["ts"]).sum()),
+            "missing_minutes_gaps": missing_minutes,
+            "null_close": int(g["close"].isna().sum()),
+            "non_positive_price_rows": int((g["close"] <= 0).sum()),
+            "non_positive_volume_rows": int((g["volume"] < 0).sum()),
+        }
+        reports.append(report)
+
+    return pd.DataFrame(reports)
+
+
+# ========================================
+# STEP 2: DYNAMIC POLYMARKET + QA SWEEP
+# ========================================
 def discover_polymarket_history_endpoints() -> List[EndpointCandidate]:
     candidates = [
-        EndpointCandidate("https://clob.polymarket.com", "/prices-history"),
-        EndpointCandidate("https://clob.polymarket.com", "/price-history"),
+        EndpointCandidate(CLOB_BASE, "/prices-history"),
+        EndpointCandidate(CLOB_BASE, "/price-history"),
         EndpointCandidate("https://data-api.polymarket.com", "/prices-history"),
         EndpointCandidate("https://data-api.polymarket.com", "/price-history"),
     ]
 
-    working = []
-    probe_market = "0"
-    now = int(time.time())
-    params = {"market": probe_market, "startTs": now - 3600, "endTs": now, "fidelity": 60}
+    working: List[EndpointCandidate] = []
+    probe_params = {
+        "market": "0",
+        "startTs": int(time.time()) - 3600,
+        "endTs": int(time.time()),
+        "fidelity": 300,
+    }
 
     for c in candidates:
         try:
-            requests.get(f"{c.base_url}{c.path}", params=params, timeout=6)
-            # if endpoint exists, we'll accept any non-404 response (schema may vary by market id)
-            resp = requests.get(f"{c.base_url}{c.path}", params=params, timeout=6)
-            if resp.status_code != 404:
+            r = requests.get(f"{c.base_url}{c.path}", params=probe_params, timeout=7)
+            if r.status_code != 404:
                 working.append(c)
         except requests.RequestException:
-            continue
+            pass
+
     return working
 
 
-def fetch_crypto_markets(limit: int = 500) -> pd.DataFrame:
-    # Gamma API catalog is usually the best market discovery source.
-    rows = _request_json(
-        "https://gamma-api.polymarket.com/markets",
-        params={"limit": limit, "active": True, "closed": False},
-    )
-    df = pd.DataFrame(rows)
+def _is_target_event_slug(slug: str) -> bool:
+    if not slug:
+        return False
+    return any(pattern.search(slug) for pattern in EVENT_PATTERNS)
+
+
+def fetch_dynamic_polymarket_events(limit: int = 1000) -> pd.DataFrame:
+    events = _request_json(f"{GAMMA_BASE}/events", {"limit": limit, "active": True, "closed": False})
+    df = pd.DataFrame(events)
     if df.empty:
         return df
 
-    search_cols = [c for c in ["question", "description", "slug"] if c in df.columns]
-    text = df[search_cols].fillna("").agg(" ".join, axis=1).str.lower() if search_cols else pd.Series("", index=df.index)
-    mask = text.str.contains("bitcoin|btc|ethereum|eth|solana|sol|crypto", regex=True)
-    return df.loc[mask].copy()
+    slug_col = "slug" if "slug" in df.columns else None
+    if slug_col is None:
+        return pd.DataFrame()
+
+    target = df[df[slug_col].fillna("").apply(_is_target_event_slug)].copy()
+    return target
 
 
 def _extract_token_ids(market_row: pd.Series) -> List[str]:
-    token_ids = []
     for key in ["clobTokenIds", "clob_token_ids"]:
         if key in market_row and pd.notna(market_row[key]):
-            try:
-                parsed = json.loads(market_row[key]) if isinstance(market_row[key], str) else market_row[key]
-                token_ids.extend([str(x) for x in parsed])
-            except Exception:
-                pass
-    return list(dict.fromkeys(token_ids))
+            raw = market_row[key]
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    return [str(x) for x in parsed]
+                except Exception:
+                    return []
+            if isinstance(raw, list):
+                return [str(x) for x in raw]
+    return []
 
 
-def fetch_polymarket_market_data(markets: pd.DataFrame, out_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_event_markets(event_ids: List[str], market_limit: int = 2000) -> pd.DataFrame:
+    markets = _request_json(f"{GAMMA_BASE}/markets", {"limit": market_limit, "active": True, "closed": False})
+    mdf = pd.DataFrame(markets)
+    if mdf.empty:
+        return mdf
+
+    event_key = "eventId" if "eventId" in mdf.columns else "event_id"
+    if event_key not in mdf.columns:
+        return pd.DataFrame()
+
+    wanted = mdf[mdf[event_key].astype(str).isin(set(event_ids))].copy()
+    return wanted
+
+
+def fetch_polymarket_history(markets_df: pd.DataFrame, out_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
     ensure_dir(out_dir)
     endpoints = discover_polymarket_history_endpoints()
+
     now = int(time.time())
     start = now - 90 * 24 * 3600
 
     hist_rows = []
     orderbook_rows = []
 
-    for _, row in markets.iterrows():
+    for _, row in markets_df.iterrows():
         market_id = str(row.get("id", row.get("conditionId", "")))
         token_ids = _extract_token_ids(row)
-        if not market_id or not token_ids:
+        if not market_id:
             continue
 
-        for fidelity in [60, 300, 900]:
+        for fidelity in [60, 300]:
             for ep in endpoints:
                 try:
                     payload = _request_json(
                         f"{ep.base_url}{ep.path}",
-                        params={"market": market_id, "startTs": start, "endTs": now, "fidelity": fidelity},
+                        {"market": market_id, "startTs": start, "endTs": now, "fidelity": fidelity},
                         timeout=10,
                     )
-                    series = payload.get("history", payload if isinstance(payload, list) else [])
-                    for p in series:
-                        ts = p.get("t") or p.get("timestamp")
-                        price = p.get("p") or p.get("price")
+                    history = payload.get("history", payload if isinstance(payload, list) else [])
+                    for point in history:
+                        ts = point.get("t") or point.get("timestamp")
+                        price = point.get("p") or point.get("price")
                         if ts is None or price is None:
                             continue
                         hist_rows.append(
@@ -189,25 +245,20 @@ def fetch_polymarket_market_data(markets: pd.DataFrame, out_dir: Path) -> Tuple[
                 except Exception:
                     continue
 
-        # best-effort current orderbook snapshots for YES/NO tokens
-        for t in token_ids:
+        for token_id in token_ids:
             try:
-                b = _request_json("https://clob.polymarket.com/book", params={"token_id": t}, timeout=8)
-                bids = b.get("bids", [])
-                asks = b.get("asks", [])
-                best_bid = float(bids[0]["price"]) if bids else np.nan
-                best_ask = float(asks[0]["price"]) if asks else np.nan
-                bid_size = float(bids[0]["size"]) if bids else 0.0
-                ask_size = float(asks[0]["size"]) if asks else 0.0
+                ob = _request_json(f"{CLOB_BASE}/book", {"token_id": token_id}, timeout=8)
+                bids = ob.get("bids", [])
+                asks = ob.get("asks", [])
                 orderbook_rows.append(
                     {
                         "market_id": market_id,
-                        "token_id": t,
+                        "token_id": token_id,
                         "snapshot_ts": pd.Timestamp.utcnow(),
-                        "best_bid": best_bid,
-                        "best_ask": best_ask,
-                        "bid_size": bid_size,
-                        "ask_size": ask_size,
+                        "best_bid": float(bids[0]["price"]) if bids else None,
+                        "best_ask": float(asks[0]["price"]) if asks else None,
+                        "bid_size": float(bids[0]["size"]) if bids else 0.0,
+                        "ask_size": float(asks[0]["size"]) if asks else 0.0,
                     }
                 )
             except Exception:
@@ -217,210 +268,174 @@ def fetch_polymarket_market_data(markets: pd.DataFrame, out_dir: Path) -> Tuple[
     ob_df = pd.DataFrame(orderbook_rows)
     hist_df.to_parquet(out_dir / "polymarket_history.parquet", index=False)
     ob_df.to_parquet(out_dir / "polymarket_orderbook_snapshots.parquet", index=False)
+
     return hist_df, ob_df
 
 
-def add_technical_features(df: pd.DataFrame, price_col: str, prefix: str) -> pd.DataFrame:
-    out = df.copy()
-    out[f"{prefix}_ret_1"] = out[price_col].pct_change(1)
-    out[f"{prefix}_ret_5"] = out[price_col].pct_change(5)
-    out[f"{prefix}_ret_15"] = out[price_col].pct_change(15)
-    out[f"{prefix}_vol_15"] = out[f"{prefix}_ret_1"].rolling(15).std()
-    out[f"{prefix}_ma_5"] = out[price_col].rolling(5).mean()
-    out[f"{prefix}_ma_20"] = out[price_col].rolling(20).mean()
-    out[f"{prefix}_ma_cross"] = out[f"{prefix}_ma_5"] / out[f"{prefix}_ma_20"] - 1
-    return out
+def polymarket_quality_report(hist_df: pd.DataFrame, ob_df: pd.DataFrame) -> pd.DataFrame:
+    if hist_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for fidelity, g in hist_df.groupby("fidelity"):
+        g = g.sort_values(["market_id", "ts"])
+        dupes = int(g.duplicated(subset=["market_id", "ts"]).sum())
+        null_price = int(g["price"].isna().sum())
+        invalid_price = int(((g["price"] < 0) | (g["price"] > 1)).sum())
+
+        rows.append(
+            {
+                "fidelity": int(fidelity),
+                "rows": int(len(g)),
+                "unique_markets": int(g["market_id"].nunique()),
+                "duplicates_market_ts": dupes,
+                "null_price": null_price,
+                "price_out_of_0_1": invalid_price,
+                "orderbook_snapshots": int(len(ob_df)),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
-def build_modeling_dataset(binance_df: pd.DataFrame, poly_hist_df: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
-    ensure_dir(out_dir)
-
+# ====================================
+# STEP 3: JOIN + QA SWEEP
+# ====================================
+def build_joined_dataset(binance_df: pd.DataFrame, polymarket_hist_df: pd.DataFrame) -> pd.DataFrame:
     b = binance_df.copy().sort_values("ts")
-    frames = []
-    for sym, g in b.groupby("symbol"):
-        gi = add_technical_features(g, "close", sym.lower())
-        gi = gi[[c for c in gi.columns if c.startswith(sym.lower()) or c in ["ts"]]]
-        frames.append(gi)
 
-    merged = frames[0]
-    for fr in frames[1:]:
-        merged = merged.merge(fr, on="ts", how="outer")
-
-    # Prefer 5-minute fidelity for target market probability dynamics.
-    ph = poly_hist_df[poly_hist_df["fidelity"] == 300].copy()
-    ph = ph.sort_values(["market_id", "ts"])
-    ph["pm_ret_1"] = ph.groupby("market_id")["price"].pct_change(1)
-    ph["pm_ret_3"] = ph.groupby("market_id")["price"].pct_change(3)
-    ph["target_up_5m"] = (ph.groupby("market_id")["price"].shift(-1) > ph["price"]).astype(int)
-
-    # aggregate across active markets at each timestamp
-    agg = (
-        ph.groupby("ts")
-        .agg(pm_price_mean=("price", "mean"), pm_price_std=("price", "std"), pm_ret_1_mean=("pm_ret_1", "mean"), target_up_5m=("target_up_5m", "mean"))
+    # resample Binance to 5m for easier alignment with up/down 5m events
+    b5 = (
+        b.set_index("ts")
+        .groupby("symbol")
+        .resample("5min")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "quote_asset_volume": "sum", "num_trades": "sum"})
         .reset_index()
     )
-    agg["target_up_5m"] = (agg["target_up_5m"] > 0.5).astype(int)
 
-    df = agg.merge(merged, on="ts", how="left").sort_values("ts")
+    # pivot symbols to one row per timestamp
+    close_wide = b5.pivot(index="ts", columns="symbol", values="close").rename(columns=lambda c: f"{c}_close")
+    volume_wide = b5.pivot(index="ts", columns="symbol", values="volume").rename(columns=lambda c: f"{c}_volume")
+    features = close_wide.join(volume_wide).reset_index()
 
-    for col in [c for c in df.columns if c not in ["ts", "target_up_5m"]]:
-        df[f"lag1_{col}"] = df[col].shift(1)
-        df[f"lag3_{col}"] = df[col].shift(3)
+    # Use 5m polymarket history for target horizon
+    pm5 = polymarket_hist_df[polymarket_hist_df["fidelity"] == 300].copy()
+    pm5 = pm5.sort_values(["market_id", "ts"])
+    pm5["target_up_5m"] = (pm5.groupby("market_id")["price"].shift(-1) > pm5["price"]).astype(int)
 
-    df = df.dropna().reset_index(drop=True)
-    df.to_parquet(out_dir / "modeling_dataset.parquet", index=False)
-    return df
+    target = pm5.groupby("ts", as_index=False).agg(pm_yes_price_mean=("price", "mean"), target_up_5m=("target_up_5m", "mean"))
+    target["target_up_5m"] = (target["target_up_5m"] > 0.5).astype(int)
 
+    joined = target.merge(features, on="ts", how="left").sort_values("ts")
 
-def train_and_evaluate(df: pd.DataFrame, out_dir: Path) -> Dict[str, float]:
-    ensure_dir(out_dir)
-    df = df.sort_values("ts").reset_index(drop=True)
+    for c in [col for col in joined.columns if col not in ["ts", "target_up_5m"]]:
+        joined[f"lag1_{c}"] = joined[c].shift(1)
 
-    feat_cols = [c for c in df.columns if c not in ["ts", "target_up_5m"]]
-    X = df[feat_cols]
-    y = df["target_up_5m"]
-
-    split = int(len(df) * 0.8)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
-
-    base = RandomForestClassifier(n_estimators=300, random_state=42, min_samples_leaf=8, n_jobs=-1)
-    model = CalibratedClassifierCV(base, method="isotonic", cv=3)
-    model.fit(X_train, y_train)
-
-    proba = model.predict_proba(X_test)[:, 1]
-    preds = (proba >= 0.5).astype(int)
-
-    metrics = {
-        "test_auc": float(roc_auc_score(y_test, proba)) if y_test.nunique() > 1 else np.nan,
-        "test_brier": float(brier_score_loss(y_test, proba)),
-        "test_accuracy": float((preds == y_test).mean()),
-    }
-
-    pred_df = df.iloc[split:][["ts"]].copy()
-    pred_df["y_true"] = y_test.values
-    pred_df["p_up"] = proba
-    pred_df.to_parquet(out_dir / "test_predictions.parquet", index=False)
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-
-    return metrics
+    joined = joined.dropna().reset_index(drop=True)
+    return joined
 
 
-def backtest_arbitrage(pred_df: pd.DataFrame, market_df: pd.DataFrame, out_dir: Path, edge: float = 0.03) -> pd.DataFrame:
-    ensure_dir(out_dir)
-    m = market_df[market_df["fidelity"] == 300].groupby("ts", as_index=False)["price"].mean().rename(columns={"price": "pm_yes_price"})
+def joined_quality_report(joined_df: pd.DataFrame) -> pd.DataFrame:
+    if joined_df.empty:
+        return pd.DataFrame()
 
-    bt = pred_df.merge(m, on="ts", how="inner").sort_values("ts")
-    bt["pm_no_price"] = 1 - bt["pm_yes_price"]
-
-    # Simple edge logic: if model p_up > yes_price + edge, buy YES; if below yes_price - edge, buy NO.
-    bt["position"] = 0
-    bt.loc[bt["p_up"] > bt["pm_yes_price"] + edge, "position"] = 1
-    bt.loc[bt["p_up"] < bt["pm_yes_price"] - edge, "position"] = -1
-
-    bt["realized"] = np.where(bt["y_true"] == 1, 1.0, 0.0)
-    bt["trade_pnl"] = 0.0
-    yes_idx = bt["position"] == 1
-    no_idx = bt["position"] == -1
-    bt.loc[yes_idx, "trade_pnl"] = bt.loc[yes_idx, "realized"] - bt.loc[yes_idx, "pm_yes_price"]
-    bt.loc[no_idx, "trade_pnl"] = (1 - bt.loc[no_idx, "realized"]) - bt.loc[no_idx, "pm_no_price"]
-
-    bt["cum_pnl"] = bt["trade_pnl"].cumsum()
-    bt.to_parquet(out_dir / "backtest_results.parquet", index=False)
-    return bt
+    return pd.DataFrame(
+        [
+            {
+                "rows": int(len(joined_df)),
+                "start_ts": joined_df["ts"].min(),
+                "end_ts": joined_df["ts"].max(),
+                "null_cells": int(joined_df.isna().sum().sum()),
+                "duplicate_ts": int(joined_df.duplicated(subset=["ts"]).sum()),
+                "target_up_rate": float(joined_df["target_up_5m"].mean()),
+            }
+        ]
+    )
 
 
-def cmd_fetch_binance(args):
+def cmd_step1_binance(args):
     out = Path(args.output_dir)
     ensure_dir(out)
-    dfs = []
-    for sym in SYMBOLS:
-        df = fetch_binance_1m(sym, months=args.months)
-        dfs.append(df)
-    result = pd.concat(dfs, ignore_index=True)
-    result.to_parquet(out / "binance_1m.parquet", index=False)
-    print(f"Saved {len(result):,} Binance rows")
+
+    chunks = []
+    for symbol in SYMBOLS:
+        print(f"Downloading Binance 1m: {symbol}")
+        chunks.append(fetch_binance_1m(symbol=symbol, months=args.months))
+
+    all_binance = pd.concat(chunks, ignore_index=True)
+    all_binance.to_parquet(out / "binance_1m.parquet", index=False)
+
+    report = binance_quality_report(all_binance)
+    report.to_csv(out / "binance_quality_report.csv", index=False)
+    print(report)
 
 
-def cmd_fetch_polymarket(args):
+def cmd_step2_polymarket(args):
     out = Path(args.output_dir)
     ensure_dir(out)
-    markets = fetch_crypto_markets(limit=args.market_limit)
-    markets.to_parquet(out / "polymarket_crypto_markets.parquet", index=False)
-    hist, ob = fetch_polymarket_market_data(markets, out)
-    print(f"Saved polymarket history rows={len(hist):,}, orderbook snapshots={len(ob):,}")
+
+    events_df = fetch_dynamic_polymarket_events(limit=args.event_limit)
+    events_df.to_parquet(out / "polymarket_dynamic_events.parquet", index=False)
+
+    event_ids = [str(x) for x in events_df.get("id", pd.Series([], dtype=str)).tolist()]
+    markets_df = fetch_event_markets(event_ids=event_ids, market_limit=args.market_limit)
+    markets_df.to_parquet(out / "polymarket_dynamic_markets.parquet", index=False)
+
+    hist_df, ob_df = fetch_polymarket_history(markets_df, out)
+    report = polymarket_quality_report(hist_df, ob_df)
+    report.to_csv(out / "polymarket_quality_report.csv", index=False)
+    print(report)
 
 
-def cmd_build_features(args):
+def cmd_step3_join(args):
     out = Path(args.output_dir)
-    b = pd.read_parquet(out / "binance_1m.parquet")
-    p = pd.read_parquet(out / "polymarket_history.parquet")
-    ds = build_modeling_dataset(b, p, out)
-    print(f"Saved modeling dataset rows={len(ds):,}")
+    ensure_dir(out)
+
+    binance_df = pd.read_parquet(out / "binance_1m.parquet")
+    poly_hist_df = pd.read_parquet(out / "polymarket_history.parquet")
+
+    joined = build_joined_dataset(binance_df, poly_hist_df)
+    joined.to_parquet(out / "joined_modeling_dataset.parquet", index=False)
+
+    report = joined_quality_report(joined)
+    report.to_csv(out / "joined_quality_report.csv", index=False)
+    print(report)
 
 
-def cmd_train_model(args):
-    out = Path(args.output_dir)
-    ds = pd.read_parquet(out / "modeling_dataset.parquet")
-    metrics = train_and_evaluate(ds, out)
-    print(json.dumps(metrics, indent=2))
+def cmd_run_steps(args):
+    cmd_step1_binance(args)
+    cmd_step2_polymarket(args)
+    cmd_step3_join(args)
 
 
-def cmd_backtest(args):
-    out = Path(args.output_dir)
-    preds = pd.read_parquet(out / "test_predictions.parquet")
-    market = pd.read_parquet(out / "polymarket_history.parquet")
-    bt = backtest_arbitrage(preds, market, out, edge=args.edge)
-    summary = {
-        "trades": int((bt["position"] != 0).sum()),
-        "avg_trade_pnl": float(bt.loc[bt["position"] != 0, "trade_pnl"].mean() if (bt["position"] != 0).any() else 0),
-        "total_pnl": float(bt["trade_pnl"].sum()),
-    }
-    print(json.dumps(summary, indent=2))
-
-
-def cmd_run_all(args):
-    cmd_fetch_binance(args)
-    cmd_fetch_polymarket(args)
-    cmd_build_features(args)
-    cmd_train_model(args)
-    cmd_backtest(args)
-
-
-def parser():
-    p = argparse.ArgumentParser(description="Polymarket + Binance prediction/arbitrage pipeline")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Step-by-step Binance + dynamic Polymarket data pipeline")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--output-dir", type=str, default="data")
 
-    p1 = sub.add_parser("fetch-binance", parents=[common])
-    p1.add_argument("--months", type=int, default=3)
-    p1.set_defaults(func=cmd_fetch_binance)
+    s1 = sub.add_parser("step1-binance", parents=[common], help="Download Binance 1m + quality checks")
+    s1.add_argument("--months", type=int, default=3)
+    s1.set_defaults(func=cmd_step1_binance)
 
-    p2 = sub.add_parser("fetch-polymarket", parents=[common])
-    p2.add_argument("--market-limit", type=int, default=500)
-    p2.set_defaults(func=cmd_fetch_polymarket)
+    s2 = sub.add_parser("step2-polymarket", parents=[common], help="Dynamic Polymarket markets + historical fetch + quality checks")
+    s2.add_argument("--event-limit", type=int, default=1000)
+    s2.add_argument("--market-limit", type=int, default=2000)
+    s2.set_defaults(func=cmd_step2_polymarket)
 
-    p3 = sub.add_parser("build-features", parents=[common])
-    p3.set_defaults(func=cmd_build_features)
+    s3 = sub.add_parser("step3-join", parents=[common], help="Join Binance and Polymarket + quality checks")
+    s3.set_defaults(func=cmd_step3_join)
 
-    p4 = sub.add_parser("train-model", parents=[common])
-    p4.set_defaults(func=cmd_train_model)
+    s4 = sub.add_parser("run-steps", parents=[common], help="Run steps 1 -> 3")
+    s4.add_argument("--months", type=int, default=3)
+    s4.add_argument("--event-limit", type=int, default=1000)
+    s4.add_argument("--market-limit", type=int, default=2000)
+    s4.set_defaults(func=cmd_run_steps)
 
-    p5 = sub.add_parser("backtest", parents=[common])
-    p5.add_argument("--edge", type=float, default=0.03)
-    p5.set_defaults(func=cmd_backtest)
-
-    p6 = sub.add_parser("run-all", parents=[common])
-    p6.add_argument("--months", type=int, default=3)
-    p6.add_argument("--market-limit", type=int, default=500)
-    p6.add_argument("--edge", type=float, default=0.03)
-    p6.set_defaults(func=cmd_run_all)
-
-    return p
+    return parser
 
 
 if __name__ == "__main__":
-    args = parser().parse_args()
+    args = build_parser().parse_args()
     args.func(args)
